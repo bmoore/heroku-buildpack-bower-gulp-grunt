@@ -1,0 +1,124 @@
+#!/usr/bin/env bash
+
+set -e            # fail fast
+set -o pipefail   # don't ignore exit codes when piping output
+# set -x          # enable debugging
+
+# Configure directories
+build_dir=$1
+cache_dir=$2
+env_dir=$3
+
+bp_dir=$(cd $(dirname $0); cd ..; pwd)
+
+# Load some convenience functions like status(), echo(), and indent()
+source $bp_dir/bin/common.sh
+
+# Output npm debug info on error
+trap cat_npm_debug_log ERR
+
+# Run subsequent node/npm commands from the build path
+cd $build_dir
+
+# Handle npm's new cert bug
+# http://blog.npmjs.org/post/78085451721/npms-self-signed-certificate-is-no-more
+if [ ! -f "$build_dir/.npmrc" ]; then
+  status "Writing a custom .npmrc to circumvent npm bugs"
+  echo "ca=" > "$build_dir/.npmrc"
+fi
+
+# Check whether we need to run the various tools
+if [ -f $build_dir/bower.json ]; then
+  run_bower=1
+else
+  run_bower=0
+fi
+if [ -f $build_dir/Gruntfile.js ] || [ -f $build_dir/Gruntfile.coffee ]; then
+  run_grunt=1
+else
+  run_grunt=0
+fi
+if [ -f $build_dir/gulpfile.js ]; then
+  run_gulp=1
+else
+  run_gulp=0
+fi
+
+# Scope config var availability only to `npm install`
+(
+  if [ -d "$env_dir" ]; then
+    status "Exporting config vars to environment"
+    export_env_dir $env_dir
+  fi
+
+  status "Installing dependencies"
+
+  if [ $run_gulp -ne 0 ] && [ ! -f $build_dir/node_modules/.bin/gulp ]; then
+    # Install gulp locally
+    npm install --userconfig $build_dir/.npmrc --production gulp 2>&1 | indent
+  fi
+  if [ $run_grunt -ne 0 ] && [ ! -f $build_dir/node_modules/.bin/grunt ]; then
+    # Install grunt locally
+    npm install --userconfig $build_dir/.npmrc --production grunt-cli 2>&1 | indent
+  fi
+  if [ $run_bower -ne 0 ] && [ ! -f $build_dir/node_modules/.bin/bower ]; then
+    # Install bower locally
+    npm install --userconfig $build_dir/.npmrc --production bower 2>&1 | indent
+  fi
+)
+
+# Persist goodies like node-version in the slug
+mkdir -p $build_dir/.heroku
+
+# Save resolved node version in the slug for later reference
+node --version > $build_dir/.heroku/node-version
+
+# Purge node-related cached content, being careful not to purge the top-level
+# cache, for the sake of heroku-buildpack-multi apps.
+rm -rf $cache_dir/node_modules # (for apps still on the older caching strategy)
+rm -rf $cache_dir/node
+mkdir -p $cache_dir/node
+
+(
+  # Run bower
+  if [ $run_bower -ne 0 ]; then
+    status "Installing frontend packages with bower"
+    export GITHUB_AUTH_TOKEN=$(cat $env_dir/GITHUB_AUTH_TOKEN)
+    export bower_shorthand_resolver=git+https://$GITHUB_AUTH_TOKEN:x-oauth-basic@github.com/{{owner}}/{{package}}
+    export bower_storage__packages=$cache_dir/bower
+    export bower_config__interactive=false
+    $build_dir/node_modules/.bin/bower install 2>&1 | indent
+  fi
+)
+
+# Check and run gulp
+(
+  if [ $run_gulp -ne 0 ]; then
+    # get the env vars
+    if [ -d "$env_dir" ]; then
+      status "Exporting config vars to environment"
+      export_env_dir $env_dir
+    fi
+
+    echo "-----> Found gulpfile, running gulp heroku:$NODE_ENV task"
+    $build_dir/node_modules/.bin/gulp heroku:$NODE_ENV 2>&1 | indent
+  else
+    echo "-----> No gulpfile found"
+  fi
+)
+
+# Check and run grunt
+(
+  if [ $run_grunt -ne 0 ]; then
+    # get the env vars
+    if [ -d "$env_dir" ]; then
+      status "Exporting config vars to environment"
+      export_env_dir $env_dir
+    fi
+
+    echo "-----> Found Gruntfile, running grunt heroku:$NODE_ENV task"
+    $build_dir/node_modules/.bin/grunt heroku:$NODE_ENV 2>&1 | indent
+  else
+    echo "-----> No Gruntfile found"
+  fi
+)
